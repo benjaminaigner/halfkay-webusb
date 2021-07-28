@@ -1,0 +1,336 @@
+<!doctype html>
+<html>
+  <head>
+    <title>HalfKay test</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+  <div class="main">
+      <div class="wrapper">
+        <div class="bot">
+          <h1>Upload-o-matic</h1>
+          <p>Choose a program to upload to an Teensy (currently TeensyLC ONLY)</p>
+          <p> Note: there has to be a serial interface in your sketch, otherwise reset to bootloader works only with the "program" button</p>
+
+          <form id="uploadForm"> 
+            <label>Program:
+              <div class="fileButtonWrapper">
+                <button id="fileButton" type="button" aria-controls="fileInput">Choose file</button>
+                <input id="fileInput" tabindex="-1" type="file"/>
+                <span id="fileName">no file chosen</span>
+              </div>
+            </label>
+
+            <button type="submit" id="uploadBtn">Upload!</button>
+          </form>
+          <form id="resetForm"> 
+          <button type="submit" id="resetBtn">Reset!</button>
+          </form>
+        </div>
+        <div class="board">
+          <img src="images/TeensyLC.jpg"/>
+        </div>
+        <div id="pipe"></div>
+        <div id="progress"></div>
+        <div id="gear"><img src="images/gear4.svg"/></div>
+      </div>
+    </div>
+    
+    <!-- HELPER FUNCTIONS -->
+    <script>
+    //credits: https://stackoverflow.com/questions/38987784/how-to-convert-a-hexadecimal-string-to-uint8array-and-back-in-javascript
+    const fromHexString = hexString =>
+  new Uint8Array(hexString.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+    </script>
+    
+    <!-- Intel HEX parser by https://github.com/bminer/intel-hex.js -->
+    <script>
+    //Intel Hex record types
+const DATA = 0,
+	END_OF_FILE = 1,
+	EXT_SEGMENT_ADDR = 2,
+	START_SEGMENT_ADDR = 3,
+	EXT_LINEAR_ADDR = 4,
+	START_LINEAR_ADDR = 5;
+
+const EMPTY_VALUE = 0xFF;
+
+/* intel_hex.parse(data)
+	`data` - Intel Hex file (string in ASCII format or Buffer Object)
+	`bufferSize` - the size of the Buffer containing the data (optional)
+	
+	returns an Object with the following properties:
+		- data - data as a Buffer Object, padded with 0xFF
+			where data is empty.
+		- startSegmentAddress - the address provided by the last
+			start segment address record; null, if not given
+		- startLinearAddress - the address provided by the last
+			start linear address record; null, if not given
+	Special thanks to: http://en.wikipedia.org/wiki/Intel_HEX
+*/
+function parseIntelHex(data) {
+	//if(data instanceof Buffer)
+		data = data.toString("ascii");
+	//Initialization
+	//TODO: this size is set for TeensyLC, is bigger for other ARM Teensy devices!
+	var buf = new Uint8Array(65536); //max. words in mega32u4 
+	var	bufLength = 0, //Length of data in the buffer
+		highAddress = 0, //upper address
+		startSegmentAddress = null,
+		startLinearAddress = null,
+		lineNum = 0, //Line number in the Intel Hex string
+		pos = 0; //Current position in the Intel Hex string
+	const SMALLEST_LINE = 11;
+	while(pos + SMALLEST_LINE <= data.length)
+	{
+		//Parse an entire line
+		if(data.charAt(pos++) != ":")
+			throw new Error("Line " + (lineNum+1) +
+				" does not start with a colon (:).");
+		else
+			lineNum++;
+		//Number of bytes (hex digit pairs) in the data field
+		var dataLength = parseInt(data.substr(pos, 2), 16);
+		pos += 2;
+		//Get 16-bit address (big-endian)
+		var lowAddress = parseInt(data.substr(pos, 4), 16);
+		pos += 4;
+		//Record type
+		var recordType = parseInt(data.substr(pos, 2), 16);
+		pos += 2;
+		//Data field (hex-encoded string)
+		var dataField = data.substr(pos, dataLength * 2);
+		if(dataLength) var dataFieldBuf = fromHexString(dataField);
+		else var dataFieldBuf = new Uint8Array();
+		pos += dataLength * 2;
+		//Checksum
+		var checksum = parseInt(data.substr(pos, 2), 16);
+		pos += 2;
+		//Validate checksum
+		var calcChecksum = (dataLength + (lowAddress >> 8) +
+			lowAddress + recordType) & 0xFF;
+		for(var i = 0; i < dataLength; i++)
+			calcChecksum = (calcChecksum + dataFieldBuf[i]) & 0xFF;
+		calcChecksum = (0x100 - calcChecksum) & 0xFF;
+		if(checksum != calcChecksum)
+			throw new Error("Invalid checksum on line " + lineNum +
+				": got " + checksum + ", but expected " + calcChecksum);
+		//Parse the record based on its recordType
+		switch(recordType)
+		{
+			case DATA:
+				var absoluteAddress = highAddress + lowAddress;
+				//Expand buf, if necessary
+				/*if(absoluteAddress + dataLength >= buf.length)
+				{
+					var tmp = Buffer.alloc((absoluteAddress + dataLength) * 2);
+					buf.copy(tmp, 0, 0, bufLength);
+					buf = tmp;
+				}*/
+				//Write over skipped bytes with EMPTY_VALUE
+				if(absoluteAddress > bufLength)
+					buf.fill(EMPTY_VALUE, bufLength, absoluteAddress);
+				//Write the dataFieldBuf to buf
+				//dataFieldBuf.copy(buf, absoluteAddress);
+				dataFieldBuf.forEach( function(val,index) {
+					buf[absoluteAddress+index] = val;
+				});
+				bufLength = Math.max(bufLength, absoluteAddress + dataLength);
+				break;
+			case END_OF_FILE:
+				if(dataLength != 0)
+					throw new Error("Invalid EOF record on line " +
+						lineNum + ".");
+				return {
+					"data": buf.slice(0, bufLength),
+					"startSegmentAddress": startSegmentAddress,
+					"startLinearAddress": startLinearAddress
+				};
+				break;
+			case EXT_SEGMENT_ADDR:
+				if(dataLength != 2 || lowAddress != 0)
+					throw new Error("Invalid extended segment address record on line " +
+						lineNum + ".");
+				highAddress = parseInt(dataField, 16) << 4;
+				break;
+			case START_SEGMENT_ADDR:
+				if(dataLength != 4 || lowAddress != 0)
+					throw new Error("Invalid start segment address record on line " +
+						lineNum + ".");
+				startSegmentAddress = parseInt(dataField, 16);
+				break;
+			case EXT_LINEAR_ADDR:
+				if(dataLength != 2 || lowAddress != 0)
+					throw new Error("Invalid extended linear address record on line " +
+						lineNum + ".");
+				highAddress = parseInt(dataField, 16) << 16;
+				break;
+			case START_LINEAR_ADDR:
+				if(dataLength != 4 || lowAddress != 0)
+					throw new Error("Invalid start linear address record on line " +
+						lineNum + ".");
+				startLinearAddress = parseInt(dataField, 16);
+				break;
+			default:
+				throw new Error("Invalid record type (" + recordType +
+					") on line " + lineNum);
+				break;
+		}
+		//Advance to the next line
+		if(data.charAt(pos) == "\r")
+			pos++;
+		if(data.charAt(pos) == "\n")
+			pos++;
+	}
+	throw new Error("Unexpected end of input: missing or invalid EOF record.");
+};
+    
+    </script>
+    
+    
+    <script>
+		
+		//credits: https://www.geeksforgeeks.org/how-to-delay-a-loop-in-javascript-using-async-await-with-promise/
+	  function waitforme(milisec) {
+			return new Promise(resolve => {
+				setTimeout(() => { resolve('') }, milisec);
+			})
+		}
+		
+		//credits: https://www.30secondsofcode.org/articles/s/javascript-array-comparison
+		const equals = (a, b) =>
+  a.length === b.length &&
+  a.every((v, i) => v === b[i]);
+	
+	  /****************/
+	  // 1.) reset TeensyLC into bootloader mode (user interaction required)
+	  /****************/
+	  async function handleReset(e) {
+		  if (!("serial" in navigator)) {
+			// The Web Serial API is not supported.
+			alert("Please use Chromium based browsers!");
+		}
+        e.preventDefault();
+		gear.classList.add('spinning');
+		let filters = [
+			  { usbVendorId: 0x16C0, usbProductId: 0x0487 }
+			  //TODO: I think there are more possible PIDs...
+			];
+          port = await navigator.serial.requestPort({filters});
+          
+          //open & close
+          // Wait for the serial port to open.
+          //source for this value: https://github.com/PaulStoffregen/teensy_loader_cli/blob/master/teensy_loader_cli.c "soft_reboot"
+		  await port.open({ baudRate: 0x86 });
+		  await waitforme(200);
+		  await port.close();
+		  //await waitforme(500);
+		  gear.classList.remove('spinning');
+	  }
+	
+	  /****************/
+	  // 2.) open the new bootloader USB-RAW HID (new USB-PID!); user interaction required
+	  /****************/
+      async function handleSubmit(e) {
+		if (!("hid" in navigator)) {
+			// The Web HID API is not supported.
+			alert("Please use Chromium based browsers!");
+		}
+        e.preventDefault();
+
+		let filecontents;
+        const file = fileInput.files[0];
+        const readerF = new FileReader();
+
+        readerF.onload = async function(event) {
+          filecontents = event.target.result;
+          gear.classList.add('spinning');
+          
+          //parse intel hex
+          let flashData = parseIntelHex(filecontents);
+          
+          //request serial port
+          let filters = [
+			  { vendorId: 0x16C0, productId: 0x0478 }
+			];
+          const [port] = await navigator.hid.requestDevice({filters});
+          
+          //open & close
+          // Wait for the RAW HID port to open.
+		  await port.open();
+		  
+		  //main source:
+		  //https://github.com/PaulStoffregen/teensy_loader_cli/blob/master/teensy_loader_cli.c
+		  let block_size = 512;
+		  for(let addr = 0; addr < flashData.data.length; addr += block_size) {
+			  //create addr array
+			  cmd = new Uint8Array(64); //this is the address block, TODO: size depends on device
+			  cmd.fill(0); // clear array
+			  cmd[0] = addr & 0xFF;
+			  cmd[1] = (addr >> 8) & 0xFF;
+			  cmd[2] = (addr >> 16) & 0xFF;
+			  
+			  //check if this is the last page, if yes fill with 0xFF
+			  if(addr + block_size > flashData.data.length)
+			  {
+				  data = flashData.data.slice(addr); //take the remaining bit
+				  pad = new Uint8Array(block_size-data.length); //create a new padding array 
+				  pad.fill(0xFF); 
+				  txx = Uint8Array.from([...cmd, ...data, ...pad]); //concat command, remaining data and padding
+				  console.log("last page");
+			  } else {
+				  data = flashData.data.slice(addr,addr+block_size); //take subarray with blocksize
+				  txx = Uint8Array.from([...cmd, ...data]); //concate command with page data
+				  console.log("page @" + addr);
+			  }
+			  
+			  //send the HID block now
+			  await port.sendReport(0,txx);
+			  
+			  //wait longer for the first block
+			  if(addr == 0)
+			  {
+				  console.log("First page, wait for 5s");
+				  await waitforme(4500);
+			  }
+			  //wait 0.5s for each block
+			  await waitforme(500);
+			  
+		  }
+		  
+		  //reboot by setting first 3 bytes to 0xFF
+		  cmd = new Uint8Array(64+block_size); //this is the address block, TODO: size depends on device
+		  cmd.fill(0); // clear array
+		  cmd[0]= cmd[1] = cmd[2] = 0xFF; //reboot command
+		  await port.sendReport(0,cmd);
+		  
+		  //finished, close port
+		  gear.classList.remove('spinning');
+		  console.log("finished");
+		  await port.close();
+         
+       };
+       readerF.readAsText(file);
+      }
+
+      const uploadForm = document.getElementById('uploadForm');
+      const resetForm = document.getElementById('resetForm');
+      const fileInput = document.getElementById('fileInput');
+      const fileButton = document.getElementById('fileButton');
+      const fileName = document.getElementById('fileName');
+      const boardType = document.getElementById('boardType');
+      const uploadBtn = document.getElementById('uploadBtn');
+      const log = document.getElementById('log');
+      const progress = document.getElementById('progress');
+      const gear = document.getElementById('gear');
+
+      uploadForm.addEventListener('submit', handleSubmit, false);
+      resetForm.addEventListener('submit', handleReset, false);
+      fileButton.addEventListener('click', () => fileInput.click());
+      fileInput.addEventListener('change', (event) => {
+        const file = event.target.files[0];
+        if (file) fileName.textContent = file.name;
+      });
+    </script>
+  </body>
+</html>
